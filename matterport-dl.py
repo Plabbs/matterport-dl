@@ -20,6 +20,7 @@ import pathlib
 import re
 import os
 import hashlib
+import html
 import platform
 
 import shutil
@@ -28,11 +29,14 @@ from typing import Any, ClassVar, cast
 from dataclasses import dataclass
 
 import logging
+import collections
+import socket
+import time
 from functools import partial
 from tqdm import tqdm as std_tqdm
 
 tqdm = partial(std_tqdm, smoothing=0.1)
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServer
 import decimal
 import signal
 
@@ -204,6 +208,104 @@ async def downloadSweeps(accessurl: str, sweeps: list[str]):
     await AsyncArrayDownload(toDownload)
 
 
+def expandTileUrlTemplate(template: str, tileCount: int) -> list[str]:
+    urls = []
+    for x in range(tileCount):
+        for y in range(tileCount):
+            for face in range(6):
+                urls.append(template.replace("<face>", str(face)).replace("<x>", str(x)).replace("<y>", str(y)))
+    return urls
+
+
+def overlayTileGridSize(template: str, tileCount) -> int:
+    # tileCount is the grid size per axis (1, 2, 4, 8), same progression getVariants uses
+    if isinstance(tileCount, int) and tileCount > 0:
+        return tileCount
+    name = template.split("?", 1)[0].rsplit("/", 1)[-1]
+    return {"512": 1, "1k": 2, "2k": 4, "4k": 8}.get(name.split("_face", 1)[0], 0)
+
+
+_OVERLAY_TILE_TEMPLATE_RE = re.compile(r"https://cdn-\d+\.matterport(?:vr)?\.(?:com|cn)/models/[^\s\"']+/overlay/[^\s\"']+/~/tiles/[^\s\"']+_face<face>_<x>_<y>\.jpg\?t=[^\s\"'&]+&k=[^\s\"']+")
+
+
+def overlayTemplatesFromShowPage(page_text: str) -> dict[str, int]:
+    # The show page embeds the tile URLs with a signature that lasts about a day. The copy in
+    # GetShowcaseSweeps is a different signature and often expires within minutes.
+    if not page_text:
+        return {}
+    decoded = page_text.replace("\\u003C", "<").replace("\\u003E", ">").replace("\\u003D", "=").replace("\\u0026", "&").replace("\\/", "/")
+    templates: dict[str, int] = {}
+    for url in _OVERLAY_TILE_TEMPLATE_RE.findall(decoded):
+        grid = overlayTileGridSize(url, None)
+        if grid > 0:
+            templates.setdefault(url, grid)
+    return templates
+
+
+def overlayTemplatesFromGraph() -> tuple[dict[str, int], set[str]]:
+    graph_path = "api/mp/models/graph_GetShowcaseSweeps.json"
+    if not os.path.exists(graph_path):
+        return {}, set()
+    try:
+        with open(graph_path, "r", encoding="UTF-8") as f:
+            graph = json.load(f)
+        locations = graph["data"]["model"]["locations"]
+    except Exception:
+        consoleLog("GetShowcaseSweeps has no sweep locations (often an APQ cache miss)", logging.WARNING)
+        return {}, set()
+    if not isinstance(locations, list):
+        return {}, set()
+    templates: dict[str, int] = {}
+    locked_paths: set[str] = set()
+    for location in locations:
+        for skybox in location.get("pano", {}).get("skyboxes", []):
+            template = skybox.get("tileUrlTemplate") or ""
+            if "/overlay/" not in template or "/tiles/" not in template or "<face>" not in template:
+                continue
+            if skybox.get("status") == "locked":
+                locked_paths.add(urlparse(template).path)
+                continue
+            grid = overlayTileGridSize(template, skybox.get("tileCount"))
+            if grid > 0:
+                templates.setdefault(template, grid)
+    return templates, locked_paths
+
+
+async def downloadOverlayTiles(show_page_text: str = ""):
+    global THIS_MODEL_ROOT_DIR, MODEL_IS_DEFURNISHED
+    # The main-model access key is rejected (403) for overlay cube-face tiles. Use the signed
+    # URLs from the show page and leave t= and k= unchanged.
+    if MODEL_IS_DEFURNISHED:
+        return
+    show_templates = overlayTemplatesFromShowPage(show_page_text)
+    graph_templates, locked_paths = overlayTemplatesFromGraph()
+    if show_templates:
+        templates = {url: grid for url, grid in show_templates.items() if urlparse(url).path not in locked_paths}
+        source = "show page"
+    else:
+        templates = graph_templates
+        source = "GetShowcaseSweeps"
+        if templates:
+            consoleLog("Show page has no overlay tile URLs; using GetShowcaseSweeps. Those signatures often expire within minutes.", logging.WARNING)
+    locked = len(locked_paths)
+
+    if not templates:
+        if locked:
+            consoleLog(f"Overlay face tiles are locked ({locked} templates), skipping", logging.WARNING)
+        else:
+            consoleLog("No overlay face tiles found in the show page or GetShowcaseSweeps")
+        return
+
+    os.chdir(THIS_MODEL_ROOT_DIR)
+    toDownload: list[AsyncDownloadItem] = []
+    for template, grid in templates.items():
+        for url in expandTileUrlTemplate(template, grid):
+            toDownload.append(AsyncDownloadItem("OVERLAY_TILES", True, url, urlparse(url).path[1:], key_type=AccessKeyType.LeaveKeyAlone))
+    consoleLog(f"Downloading {len(toDownload)} overlay face tiles from {len(templates)} {source} templates ({locked} locked skipped)...")
+    await AsyncArrayDownload(toDownload)
+    consoleLog(f"Done with overlay tiles ({len(toDownload)} tile requests).")
+
+
 # these 3 downwload with json posts were old functions for old graphql queries we dont need/use ducrrently
 async def downloadFileWithJSONPostAndGetText(type, shouldExist, url, file, post_json_str, descriptor, always_download=False):
     if not CLA.getCommandLineArg(CommandLineArg.TILDE):
@@ -275,6 +377,14 @@ async def downloadFileAndGetText(type, shouldExist, url, file, post_data=None, i
             return await f.read()
 
 
+def downloadTargetPath(file: str) -> str:
+    if not CLA.getCommandLineArg(CommandLineArg.TILDE):
+        file = file.replace("~", "_")
+    if "?" in file:
+        file = file.split("?", 1)[0]
+    return file
+
+
 # Add type parameter, shortResourcePath, shouldExist
 async def downloadFile(type, shouldExist, url, file, post_data=None, always_download=False, key_type: AccessKeyType = AccessKeyType.PrimaryKey):
     global MAX_TASKS_SEMAPHORE, OUR_SESSION
@@ -286,13 +396,10 @@ async def downloadFile(type, shouldExist, url, file, post_data=None, always_down
                 key = KeyHandler.GetAccessKey(key_type)
             url = KeyHandler.SetAccessKeyForUrl(url, key)
 
-        if not CLA.getCommandLineArg(CommandLineArg.TILDE):
-            file = file.replace("~", "_")
+        file = downloadTargetPath(file)
 
         if "/" in file:
             makeDirs(os.path.dirname(file))
-        if "?" in file:
-            file = file.split("?")[0]
 
         if not CLA.getCommandLineArg(CommandLineArg.DOWNLOAD) or (os.path.exists(file) and not always_download):  # skip already downloaded files except always download ones which are genreally ones that may contain keys?
             logUrlDownloadSkipped(type, file, url, "")
@@ -401,7 +508,7 @@ class ProgressStats:
 
     def Increment(self, typ: ProgressType, amt: int = 1):
         with self.locks[typ]:
-            self.stats[typ] += 1
+            self.stats[typ] += amt
             return self.stats[typ]
 
 
@@ -456,23 +563,84 @@ def _logUrlDownload(logLevel, logPrefix, type, localTarget, url, additionalParam
     logging.log(logLevel, f"{logPrefix} REQ for {type} {requestID}: should exist: {shouldExist} {optionalResult} File: {localTarget} at url: {url} {key_type} {additionalParams}")
 
 
-def extractJSDict(forWhat: str, str: str):
+def parseJSDictBody(forWhat: str, body: str):
+    # Parses the inside of a JS object literal with numeric keys ie: 239:"three-examples",777:"split"
     ret: dict[str, str] = {}
-    # Expects a string where the first { starts the dict and last } ends it.
-    startPos = str.find("{")
-    if startPos == -1:
-        raise Exception(f"Unable to extract JS dictionary for: {forWhat} from the JS string: {str} can't find first {{")
-    endPos = str.rfind("}")
-    if endPos == -1:
-        raise Exception(f"Unable to extract JS dictionary for: {forWhat} from the JS string: {str} can't find last }}")
-    str = str[startPos + 1 : endPos]
-    pairs = str.split(",")
-    for kvp in pairs:
+    for kvp in body.split(","):
         arr = kvp.replace('"', "").split(":")
-        key = arr[0]
-        key = int(float(key))  # keys can be in scientific notation
-        ret[f"{key}"] = arr[1]
+        if len(arr) < 2:
+            continue
+        try:
+            key = int(float(arr[0]))  # keys can be in scientific notation
+        except ValueError:
+            consoleDebugLog(f"Skipping entry in JS dictionary for: {forWhat} that has a non numeric key of: {arr[0]}")
+            continue
+        ret[f"{key}"] = ":".join(arr[1:])
     return ret
+
+
+def parseBalancedJSDict(text: str, bracePos: int):
+    # Takes text and the index of a { character, returns the text between the braces and the index just after the matching }, ("", -1) if unbalanced
+    depth = 0
+    for i in range(bracePos, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[bracePos + 1 : i], i + 1
+    return "", -1
+
+
+def findAllBalancedJSDicts(text: str):
+    # Returns the body (without the braces) of every top level {} in the text
+    ret: list[str] = []
+    pos = 0
+    while True:
+        bracePos = text.find("{", pos)
+        if bracePos == -1:
+            return ret
+        body, endPos = parseBalancedJSDict(text, bracePos)
+        if endPos == -1:
+            return ret
+        ret.append(body)
+        pos = endPos
+
+
+# The showcase runtime js builds the chunk file names from a couple of maps, the names map is optional and so is the key (hash) map, the formats seen so far are:
+#   d.u = e => "js/" + ({239:"three-examples",9114:"core"}[e] || e) + "." + {172:"6c50ed8e5ff7620de75b",9114:"8aa28bbfc8f4948fd4d1"}[e] + ".js"  # names + keys
+#   d.u = e => "js/" + ({239:"three-examples",9114:"core"}[e] || e) + ".js"  # names only, what the 2026 and newer builds do (no key map at all)
+#   d.u = e => "js/" + e + "." + {172:"6c50ed8e5ff7620de75b"}[e] + ".js"  # keys only
+# with the css one being d.miniCssF = e => "css/" + ({7475:"late",9114:"core"}[e] || e) + ".css" (the css key is always 1 so it is never in the file)
+# Every css chunk id is listed in the mini css chunk map, ie: d.f.miniCss = (r,o) => { ... {1991:1,7475:1,9114:1}[r] && ... }
+# returns (jsNames, jsKeys, cssNames, cssChunkIds), jsKeys is empty on the newer builds that have no key map
+def extractWebpackChunkMaps(runtimeText: str):
+    jsMatch = re.search(r'"js/"\+(?P<body>.+?)\+"\.js"', runtimeText, flags=re.S)
+    if jsMatch is None:
+        raise Exception('Unable to find the js chunk url function (the "js/"+ ... +".js" part) in the showcase runtime js file, matterport may have changed the format')
+    jsBody = jsMatch.group("body")
+    jsDicts = findAllBalancedJSDicts(jsBody)
+    if '+"."+{' in jsBody:  # the key map is there so the chunk file names include a per chunk key (hash)
+        jsNames = parseJSDictBody("showcase-runtime.js: namedJSFiles", jsDicts[0]) if len(jsDicts) >= 2 else {}
+        jsKeys = parseJSDictBody("showcase-runtime.js: JSFileToKey", jsDicts[-1])
+    else:
+        jsNames = parseJSDictBody("showcase-runtime.js: namedJSFiles", jsDicts[0]) if len(jsDicts) >= 1 else {}
+        jsKeys = {}
+
+    cssNames: dict[str, str] = {}
+    cssMatch = re.search(r'"css/"\+(?P<body>.+?)\+"\.css"', runtimeText, flags=re.S)
+    if cssMatch is not None:
+        cssDicts = findAllBalancedJSDicts(cssMatch.group("body"))
+        if len(cssDicts) >= 1:
+            cssNames = parseJSDictBody("showcase-runtime.js: namedCSSFiles", cssDicts[0])
+
+    cssChunkIds: set[str] = set()
+    cssMap = re.search(r"\{(?P<ids>(?:[0-9]{1,7}:1,)*[0-9]{1,7}:1)\}\[", runtimeText)
+    if cssMap is not None:
+        cssChunkIds = set(re.findall(r"[0-9]+(?=:1)", cssMap.group("ids")))
+    if len(cssChunkIds) == 0:  # no map of every css chunk, the named ones are all we know about
+        cssChunkIds = set(cssNames.keys())
+    return jsNames, jsKeys, cssNames, cssChunkIds
 
 
 async def downloadAssets(base, base_page_text):
@@ -539,61 +707,27 @@ async def downloadAssets(base, base_page_text):
     await downloadFile("STATIC_ASSET", True, "https://matterport.com/nextjs-assets/images/favicon.ico", "favicon.ico")  # mainly to avoid the 404, always matterport.com
     showcase_cont = await downloadFileAndGetText(typeDict[showcase_runtime_filename], True, base + showcase_runtime_filename, showcase_runtime_filename, always_download=CLA.getCommandLineArg(CommandLineArg.REFRESH_KEY_FILES))
 
-    # lets try to extract the js files it might be loading and make sure we know them, the code has things like .e(858)  ot load which are the numbers we care about
-    # js_extracted = re.findall(r"\.e\(([0-9]{2,3})\)", showcase_cont)
-    # here is how the JS is prettied up (aka with spaces).  First are JS files with specific names, second are the js files to key, and finally are the css files.   The js files with specific names you still need the key for just instead of [number].[key].js it is [name].[key].js
-    # , d.u = e => "js/" + ({
-    #     239: "three-examples",
-    #     777: "split",
-    #     1662: "sdk-bundle",
-    #     9114: "core",
-    #     9553: "control-kit"
-    # } [e] || e) + "." + {
-    #     172: "6c50ed8e5ff7620de75b",
-    #     9553: "8aa28bbfc8f4948fd4d1",
-    #     9589: "dc4901b493f7634edbcf",
-    #     9860: "976dc6caac98abda24c9"
-    # } [e] + ".js", d.miniCssF = e => "css/" + ({
-    #     7475: "late",
-    #     9114: "core"
-    # } [e] || e) + ".css"
+    # lets try to extract the js files it might be loading and make sure we know them, the code has things like .e(858) to load which are the numbers we care about
+    # see extractWebpackChunkMaps for what the chunk url functions in the runtime js look like
+    jsNamedDict, jsKeyDict, cssNamedDict, cssChunkIds = extractWebpackChunkMaps(showcase_cont)
 
-    match = re.search(
-        r"""
-                "js/"\+ # find js/+  (literal plus)
-                (?P<namedJSFiles>[^\[]+) #capture everything until the first [ character store in group namedJSFiles
-                (?P<JSFileToKey>.+?) #least greedy capture, so capture the minimum amount to make this regex still true
-                css #stopping when we see the css
-                (?P<namedCSSFiles>[^\[]+) #similar to before capture to first [
-                .+? #skip the minimum amount to get to next part
-                miniCss=.+? #find miniCss= then skip minimum to first &&
-                &&
-                (?P<CSSFileToKey>.+?) #capture minimum until we get to next &&
-                &&
-              """,
-        showcase_cont,
-        re.X,
-    )
-    if match is None:
-        raise Exception("Unable to extract js files and css files from showcase runtime js file")
-    groupDict = match.groupdict()
-    jsNamedDict = extractJSDict("showcase-runtime.js: namedJSFiles", groupDict["namedJSFiles"])
-    jsKeyDict = extractJSDict("showcase-runtime.js: JSFileToKey", groupDict["JSFileToKey"])
-    cssNamedDict = extractJSDict("showcase-runtime.js: namedCSSFiles", groupDict["namedCSSFiles"])
-    cssKeyDict = extractJSDict("showcase-runtime.js: CSSFileToKey", groupDict["CSSFileToKey"])
+    def chunkJsFile(chunkId: str):
+        name = jsNamedDict.get(chunkId, chunkId)  # chunks with no name in the map use the chunk id as the file name
+        if chunkId in jsKeyDict:
+            return f"js/{name}.{jsKeyDict[chunkId]}.js"
+        return f"js/{name}.js"
 
-    for number, key in jsKeyDict.items():
-        name = number
-        if name in jsNamedDict:
-            name = jsNamedDict[name]
-        file = f"js/{name}.{key}.js"
+    # When there is a key map every js chunk is listed in it, when there isn't (newer builds) the chunk ids can only be
+    # discovered from the chunk load calls in the js, which means waiting until after the js has been downloaded, see below
+    jsChunkIds: set[str] = set(jsKeyDict.keys())
+
+    for number in jsKeyDict.keys():
+        file = chunkJsFile(number)
         typeDict[file] = "SHOWCASE_DISCOVERED_JS"
         assets.append(file)
 
-    for number, key in cssKeyDict.items():
-        name = number
-        if name in cssNamedDict:
-            name = cssNamedDict[name]
+    for number in cssChunkIds:
+        name = cssNamedDict.get(number, number)
         file = f"css/{name}.css"  # key is not used for css its just 1 always
         typeDict[file] = "SHOWCASE_DISCOVERED_CSS"
         assets.append(file)
@@ -623,6 +757,45 @@ async def downloadAssets(base, base_page_text):
         shouldExist = True
         toDownload.append(AsyncDownloadItem(type, shouldExist, f"{base}{asset}", local_file))
     await AsyncArrayDownload(toDownload)
+    if len(jsKeyDict) == 0:
+        # Newer builds have no map listing every chunk so the chunk ids have to come from the chunk load calls and the
+        # async import maps in the js. Chunks can load chunks that the main js never mentions so this goes in rounds
+        # as more of the js arrives
+        for roundNum in range(6):
+            foundChunkIds: set[str] = set()
+            for jsFile in pathlib.Path("js").glob("*.js"):
+                try:
+                    with open(jsFile, "r", encoding="utf-8", errors="ignore") as f:
+                        foundChunkIds |= extractChunkIdsFromJs(f.read())
+                except Exception as e:
+                    consoleDebugLog(f"Failed to scan {jsFile} for chunk ids: {e}")
+            newChunkIds = foundChunkIds - jsChunkIds
+            if len(newChunkIds) == 0:
+                break
+            consoleDebugLog(f"Found {len(newChunkIds)} webpack chunks from chunk references, round: {roundNum}")
+            jsChunkIds |= newChunkIds
+            chunkDownloads: list[AsyncDownloadItem] = []
+            for chunkId in sorted(newChunkIds):
+                file = chunkJsFile(chunkId)
+                chunkDownloads.append(AsyncDownloadItem("SHOWCASE_DISCOVERED_JS", False, f"{base}{file}", file))  # shouldExist false as some chunk ids are css only so have no js file
+            await AsyncArrayDownload(chunkDownloads)
+
+    # Same deal for static files the js/css references that we don't have a hardcoded entry for, ie: images/atlas.png
+    referencedFiles: set[str] = set()
+    for textFile in list(pathlib.Path("js").glob("*.js")) + list(pathlib.Path("css").glob("*.css")):
+        try:
+            with open(textFile, "r", encoding="utf-8", errors="ignore") as f:
+                referencedFiles |= extractReferencedStaticFiles(f.read())
+        except Exception as e:
+            consoleDebugLog(f"Failed to scan {textFile} for referenced static files: {e}")
+    referencedFiles = {f for f in referencedFiles if not os.path.exists(f) and f not in typeDict}
+    if len(referencedFiles) > 0:
+        consoleDebugLog(f"Found {len(referencedFiles)} static files referenced by the downloaded js/css")
+        referencedDownloads: list[AsyncDownloadItem] = []
+        for file in sorted(referencedFiles):
+            referencedDownloads.append(AsyncDownloadItem("STATIC_DISCOVERED", False, f"{base}{file}", file))
+        await AsyncArrayDownload(referencedDownloads)
+
     if react_vendor_filename and os.path.exists(react_vendor_filename):
         reactCont = ""
         with open(react_vendor_filename, "r", encoding="UTF-8") as f:
@@ -677,10 +850,23 @@ class ExceptionWhatExceptionTaskGroup(asyncio.TaskGroup):
 
 
 async def AsyncArrayDownload(assets: list[AsyncDownloadItem]):
+    PROGRESS.RelativeMark()
+    pending: list[AsyncDownloadItem] = []
+    already = 0
+    for asset in assets:
+        # Checking here avoids a task and a progress tick per file that is already saved.
+        # A re-run otherwise spends minutes walking tens of thousands of existing tiles.
+        if os.path.exists(downloadTargetPath(asset.file)):
+            already += 1
+        else:
+            pending.append(asset)
+    if already:
+        PROGRESS.Increment(ProgressType.Skipped, already)
+        consoleLog(f"Skipping {already} files already on disk")
+    if not pending:
+        return
     async with ExceptionWhatExceptionTaskGroup() as tg:
-        PROGRESS.RelativeMark()
-
-        for asset in tqdm(assets):
+        for asset in tqdm(pending):
             tg.create_task(downloadFile(asset.type, asset.shouldExist, asset.url, asset.file, key_type=asset.key_type))
             await asyncio.sleep(0.001)  # we need some sleep or we will not yield
             while MAX_TASKS_SEMAPHORE.locked():
@@ -719,14 +905,44 @@ async def downloadInfo(pageid):
         KeyHandler.SaveKeysFromText(f"FilesType{i}", fileText)  # used to be more elegant but now we can just gobble all the keys
 
 
+# Chunk ids in the js come from two places, the chunk load calls (`.e(<chunkId>)`) and the async import maps which
+# look like {"./cwf_en-US.yaml":[42622,2622],"./matterport-logo-white-r.svg":[58249,8249]}, the first number there is
+# the module id and any after it are the chunks that have to be loaded for it
+def extractChunkIdsFromJs(text: str):
+    ids = set(re.findall(r"\.e\(([0-9]{1,7})\)", text))
+    # A repeated capturing group only keeps its last match, so split the list and drop the module id.
+    for m in re.finditer(r'"\./[^"]{1,200}":\[([0-9]{1,7}(?:,[0-9]{1,7})+)\]', text):
+        ids.update(m.group(1).split(",")[1:])
+    return ids
+
+
+# The js/css can reference static files that aren't in the hardcoded lists above (images/atlas.png for example), some
+# of what is found will be names built up at runtime that don't exist on the server, those are just a 404 in the log
+def extractReferencedStaticFiles(text: str):
+    ret: set[str] = set()
+    for ref in re.findall(r"((?:images|cursors|fonts)/[A-Za-z0-9._\-/]+\.[A-Za-z0-9]{1,5})", text):
+        ret.add(ref.split("?")[0])
+    return ret
+
+
 async def downloadPlugins(pageid):
     global BASE_MATTERPORT_DOMAIN
     pluginJson: Any
     with open("api/v1/plugins", "r", encoding="UTF-8") as f:
         pluginJson = json.loads(f.read())
     for plugin in pluginJson:
-        plugPath = f"showcase-sdk/plugins/published/{plugin['name']}/{plugin['currentVersion']}/plugin.json"
-        await downloadFile("PLUGIN", True, f"https://static.{BASE_MATTERPORT_DOMAIN}/{plugPath}", plugPath)
+        versions = [plugin["currentVersion"]]
+        match = re.match(r"(?P<base>[0-9.]+)-(?P<build>[0-9]+)$", plugin["currentVersion"])
+        if match:  # the player strips a trailing build number when making the url, ie compass 1.0.14-1 asks for 1.0.14 (but color-grade 0.9.3-beta.5 asks for exactly that)
+            versions.append(match.group("base"))
+        for version in versions:
+            plugPath = f"showcase-sdk/plugins/published/{plugin['name']}/{version}/plugin.json"
+            try:
+                await downloadFile("PLUGIN", version == versions[0], f"https://static.{BASE_MATTERPORT_DOMAIN}/{plugPath}", plugPath)
+            except Exception as e:
+                if version == versions[0]:
+                    raise
+                consoleDebugLog(f"Skipping plugin url that doesn't seem to exist: {plugPath} of: {e}")  # only the current version is guaranteed to be there
 
 
 async def downloadAttachments():
@@ -857,7 +1073,7 @@ async def downloadCapture(pageid):
         if not os.path.exists(fl):
             shutil.copy2(os.path.join(BASE_MATTERPORTDL_DIR, fl), fl)
 
-    logging.basicConfig(filename="run_report.log", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S", encoding="utf-8")
+    logging.basicConfig(filename="run_report.log", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S", encoding="utf-8", force=True)
 
     if CLA.getCommandLineArg(CommandLineArg.DEBUG):
         makeDirs("debug")
@@ -965,6 +1181,9 @@ async def downloadCapture(pageid):
     await downloadAttachments()
     open("api/v1/event", "a").close()
     if CLA.getCommandLineArg(CommandLineArg.MAIN_ASSET_DOWNLOAD):
+        # Do this before the primary sweep walk. That walk checks every tile already on disk, and the
+        # short-lived GetShowcaseSweeps signature dies during it. The show page signature lasts longer.
+        await downloadOverlayTiles(base_page_text)
         consoleLog(f"Downloading primary model assets has 4k: {SWEEP_DO_4K}...")
         await downloadMainAssets(pageid, accessurl)
     os.chdir(THIS_MODEL_ROOT_DIR)
@@ -1269,11 +1488,225 @@ def getPageId(url):
     return id
 
 
+SLOW_REQUEST_SECONDS = 8
+
+
+class ServeRequestTracker:
+    """Keeps track of what the browser currently has in flight.
+
+    When the viewer sits on the loading spinner forever the useful question is "what is still
+    being waited on", so the server answers that at GET /__diag (the page side watchdog in
+    JSNetProxy.js posts there for us too, which lands both sides of the story in server.log)
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.nextId = 0
+        self.inFlight: dict[int, dict] = {}
+        self.slow = collections.deque(maxlen=40)
+        self.recent = collections.deque(maxlen=25)
+        self.missing = collections.deque(maxlen=25)
+        self.lastRequestStarted = 0.0
+
+    def start(self, method, path):
+        with self.lock:
+            self.nextId += 1
+            id = self.nextId
+            self.inFlight[id] = {"method": method, "path": path, "started": time.time()}
+            self.lastRequestStarted = time.time()
+        return id
+
+    def noteMissing(self, id):
+        # A placeholder is HTTP 200 so the viewer can move on. Remember that the file was absent.
+        with self.lock:
+            item = self.inFlight.get(id)
+            if item is None:
+                return
+            item["missing"] = True
+            self.missing.append({"method": item["method"], "path": item["path"]})
+
+    def finish(self, id, status):
+        with self.lock:
+            item = self.inFlight.pop(id, None)
+            if item is None:
+                return
+            took = item["tookSeconds"] = round(time.time() - item["started"], 2)
+            item["status"] = status
+            entry = {k: item[k] for k in ("method", "path", "status", "tookSeconds")}
+            if item.get("missing"):
+                entry["missing"] = True
+            self.recent.append(entry)
+            if took > SLOW_REQUEST_SECONDS:
+                self.slow.append(item)
+        if took > SLOW_REQUEST_SECONDS:
+            consoleDebugLog(f"Request took {took}s: {item['method']} {item['path']}", loglevel=logging.WARNING)
+
+    def snapshot(self):
+        now = time.time()
+        with self.lock:
+            flight = [{"method": i["method"], "path": i["path"], "ageSeconds": round(now - i["started"], 1)} for i in self.inFlight.values()]
+            flight.sort(key=lambda i: -i["ageSeconds"])
+            recent = [r for r in self.recent if not r["path"].startswith("/__diag")]
+            return {
+                "inFlightCount": len(flight),
+                "inFlight": flight,
+                "secondsSinceLastRequest": round(now - self.lastRequestStarted, 1) if self.lastRequestStarted else None,
+                "lastRequests": recent[-12:],
+                "missingAssets": list(self.missing)[-12:],
+                "slowRequests": list(self.slow)[-10:],
+            }
+
+
+SERVE_REQUEST_TRACKER = ServeRequestTracker()
+
+
+_PLACEHOLDER_PNG = None
+
+
+def _getPlaceholderPng():
+    """Return a tiny valid 1x1 gray PNG, served for missing image assets so the
+    viewer degrades to a glitch (missing tile) instead of hanging on a 404."""
+    global _PLACEHOLDER_PNG
+    if _PLACEHOLDER_PNG is None:
+        import zlib
+        import struct
+
+        def _chunk(tag, data):
+            return (struct.pack(">I", len(data)) + tag + data
+                    + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+        _PLACEHOLDER_PNG = (b"\x89PNG\r\n\x1a\n"
+            + _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + _chunk(b"IDAT", zlib.compress(b"\x00\x80\x80\x80"))
+            + _chunk(b"IEND", b""))
+    return _PLACEHOLDER_PNG
+
+
 class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
+    # HTTP/1.1 so the browser can reuse a connection for the many parallel asset requests it
+    # makes.  With the default of HTTP/1.0 every single asset needs a brand new connection which,
+    # combined with a server that can only talk to one connection at a time, is how you end up
+    # with a request that never gets an answer (viewer stuck on the loading spinner until reload)
+    protocol_version = "HTTP/1.1"
+    # Browsers do open connections they never send a request on, don't let those (or a stalled
+    # keep alive connection) hold on to a handler thread forever
+    timeout = 30
+    _sentConnectionHeader = False
+    _responseStatus = None
+    _trackId = None
+
+    def handle_one_request(self):
+        # The timeout only guards an idle keep alive connection while we wait for the next request
+        # to arrive, it must never cut off a large asset being written to a reader that is
+        # momentarily busy (parse, decode, upload) which is how a viewer can end up half loaded
+        self._sentConnectionHeader = False
+        self.connection.settimeout(self.timeout)
+        try:
+            SimpleHTTPRequestHandler.handle_one_request(self)
+        except (socket.timeout, TimeoutError):
+            self.close_connection = True
+        finally:
+            SERVE_REQUEST_TRACKER.finish(self._trackId, self._responseStatus)
+            self._trackId = None
+
+    def parse_request(self):
+        result = SimpleHTTPRequestHandler.parse_request(self)
+        self.connection.settimeout(None)
+        if result:
+            self._responseStatus = None
+            self._trackId = SERVE_REQUEST_TRACKER.start(self.command, self.path)
+        return result
+
+    def send_response_only(self, code, message=None):
+        try:
+            self._responseStatus = int(code)
+        except (TypeError, ValueError):
+            self._responseStatus = code
+        SimpleHTTPRequestHandler.send_response_only(self, code, message)
+
+    def log_error(self, format, *args):
+        msg = format % args
+        if "timed out" in msg:
+            consoleDebugLog("Closing an idle connection with no request on it", loglevel=logging.DEBUG)
+        else:
+            consoleLog(msg, logging.ERROR)
+
+    def respondJson(self, body):
+        if type(body) is not bytes:
+            body = json.dumps(body).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        # Content length is required with HTTP/1.1 or the browser sits waiting for a body forever
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def send_error(self, code, message=None, explain=None):
         if code == 404:
             consoleLog(f"###### 404 error: {self.path} may not be downloading everything right", logging.WARNING)
+            # Serve a placeholder instead of a 404 for a missing model asset so the
+            # viewer degrades to a glitch (missing tile) rather than hanging on a
+            # request that never returns. A 404 here can leave the viewer waiting
+            # on a promise forever (loading spinner only a reload gets out of).
+            placeholder = self._placeholderForMissingAsset()
+            if placeholder is not None:
+                content_type, body = placeholder
+                SERVE_REQUEST_TRACKER.noteMissing(self._trackId)
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                # A normal refresh should pick up the real file once it has been downloaded.
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            # Keep the connection. Stock send_error always sends Connection: close and
+            # leaves the socket open, so the browser opens a new connection per 404.
+            body = self._errorPage(code, message, explain)
+            self.send_response(code, message)
+            self.send_header("Content-Type", "text/html;charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD" and body:
+                self.wfile.write(body)
+            return
+        # Stock send_error tells the client to close. Close the socket too, or the next
+        # request on this connection is written to a client that has already hung up.
+        self.close_connection = True
         SimpleHTTPRequestHandler.send_error(self, code, message, explain)
+
+    def _errorPage(self, code, message, explain):
+        try:
+            shortmsg, longmsg = self.responses[code]
+        except KeyError:
+            shortmsg, longmsg = "???", "???"
+        if message is None:
+            message = shortmsg
+        if explain is None:
+            explain = longmsg
+        content = (
+            "<!DOCTYPE HTML>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+            f"<title>Error response</title>\n</head>\n<body>\n<h1>Error response</h1>\n"
+            f"<p>Error code: {code}</p>\n<p>Message: {html.escape(str(message))}.</p>\n"
+            f"<p>Error code explanation: {code} - {html.escape(str(explain))}.</p>\n</body>\n</html>\n"
+        )
+        return content.encode("utf-8", "replace")
+
+    def _placeholderForMissingAsset(self):
+        """Return (content_type, body) to serve for a missing model asset so the
+        viewer degrades gracefully instead of hanging on a 404, or None to keep
+        the normal 404 (for paths that are not model assets)."""
+        raw_path = self.getRawPath()
+        if not raw_path.startswith("/models/"):
+            return None
+        ext = os.path.splitext(raw_path)[1].lower()
+        if ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"):
+            return ("image/png", _getPlaceholderPng())
+        if ext == ".json":
+            return ("application/json", b"{}")
+        # Any other missing model asset: complete the request with an empty body
+        # so the viewer does not wait on a promise forever
+        return ("application/octet-stream", b"")
 
     def log_request(self, code="-", size="-"):
         if CLA.getCommandLineArg(CommandLineArg.QUIET) and code == 200:
@@ -1282,10 +1715,21 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_my_headers()
+        if self.close_connection and self.request_version != "HTTP/0.9" and not self._sentConnectionHeader:
+            # Say we are hanging up rather than letting the client find out when it goes to
+            # reuse the connection (browsers will not retry a post on a connection that vanished)
+            self.send_header("Connection", "close")
         SimpleHTTPRequestHandler.end_headers(self)
+
+    def send_header(self, keyword, value):
+        if keyword.lower() == "connection":
+            self._sentConnectionHeader = True
+        SimpleHTTPRequestHandler.send_header(self, keyword, value)
 
     def do_OPTIONS(self):
         self.send_response(200)
+        # Content length is required with HTTP/1.1 or the browser sits waiting for a body forever
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def send_my_headers(self):
@@ -1314,6 +1758,10 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
 
         orig_raw_path = raw_path = self.getRawPath()
         query = self.getQuery()
+        if raw_path == "/__diag":
+            # what the browser is waiting on right now, see ServeRequestTracker above
+            self.respondJson(SERVE_REQUEST_TRACKER.snapshot())
+            return
         if urlparse(self.path).path == "/api/mp/models/graph":
             query_args = urllib.parse.parse_qs(query)
             self.do_GraphRequest(query_args.get("operationName", [None])[0])
@@ -1324,11 +1772,14 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
 
         if raw_path.startswith("/JSNetProxy.js"):
             consoleDebugLog("Using our javascript network proxier", loglevel=logging.INFO)
-            self.send_response(200)
-            self.end_headers()
             with open(os.path.join(BASE_MATTERPORTDL_DIR, "JSNetProxy.js"), "r", encoding="UTF-8") as f:
-                self.wfile.write(f.read().encode("utf-8"))
-                return
+                proxyText = f.read().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", str(len(proxyText)))
+            self.end_headers()
+            self.wfile.write(proxyText)
+            return
 
         if raw_path.startswith("/locale/messages/strings_") and not os.path.exists(f".{raw_path}"):
             redirect_msg = "original request was for a locale we do not have downloaded"
@@ -1377,18 +1828,22 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
     def do_GraphRequest(self, option_name: str):
         post_msg = None
         logLevel = logging.INFO
+        body = bytes('{"data": "empty"}', "utf-8")
         if option_name in GRAPH_DATA_REQ:
-            self.send_response(200)
-            self.end_headers()
             file_path = f"api/mp/models/graph_{option_name}.json"
             if os.path.exists(file_path):
                 with open(file_path, "r", encoding="UTF-8") as f:
-                    self.wfile.write(f.read().encode("utf-8"))
-                    post_msg = f"graph of operationName: {option_name} we are handling internally"
+                    body = f.read().encode("utf-8")
+                post_msg = f"graph of operationName: {option_name} we are handling internally"
             else:
                 logLevel = logging.WARNING
-                post_msg = f"graph for operationName: {option_name} we don't know how to handle, but likely could add support, returning empty instead. If you get an error this may be why (include this message in bug report)."
-                self.wfile.write(bytes('{"data": "empty"}', "utf-8"))
+                post_msg = f"graph for operationName: {option_name} we have no saved response for, returning empty instead. If you get an error this may be why (include this message in bug report)."
+        else:
+            logLevel = logging.WARNING
+            post_msg = f"graph request for operationName: {option_name} is not one we know how to handle, returning empty instead. If you get an error this may be why (include this message in bug report)."
+        # Always send a complete response, a request that gets nothing back at all leaves the
+        # showcase waiting on a promise forever (loading spinner only a reload gets out of)
+        self.respondJson(body)
 
         if post_msg is not None:
             consoleDebugLog(f"Handling a graph request on {self.path}: {post_msg}", loglevel=logLevel)
@@ -1397,9 +1852,21 @@ class OurSimpleHTTPRequestHandler(SimpleHTTPRequestHandler):
         post_msg = None
         logLevel = logging.INFO
         try:
+            content_len = int(self.headers.get("content-length") or "0")
+            post_body = self.rfile.read(content_len).decode("utf-8") if content_len > 0 else ""
+            if (self.headers.get("transfer-encoding") or "").lower() == "chunked":
+                # We can not consume a chunked body, end this connection so the bytes the
+                # client still sends can not be mistaken for the next request on it
+                self.close_connection = True
+            if urlparse(self.path).path == "/__diag":
+                # the page side watchdog of JSNetProxy.js telling us the viewer never came up,
+                # log both sides of the story so server.log explains a hang after the fact
+                consoleLog(f"Page reports the viewer is stuck: {post_body[:1500]}", logging.WARNING)
+                snapshot = SERVE_REQUEST_TRACKER.snapshot()
+                consoleLog(f"What the server saw when the page asked: {json.dumps(snapshot)}", logging.WARNING)
+                self.respondJson(snapshot)
+                return
             if urlparse(self.path).path == "/api/mp/models/graph":
-                content_len = int(self.headers.get("content-length") or "0")
-                post_body = self.rfile.read(content_len).decode("utf-8")
                 json_body = json.loads(post_body)
                 option_name = json_body["operationName"]
                 self.do_GraphRequest(option_name)
@@ -1474,6 +1941,26 @@ def RegisterWindowsBrowsers():
             webbrowser.register(name, None, webbrowser.GenericBrowser(cmd))
 
 
+class OurThreadingHTTPServer(ThreadingHTTPServer):
+    # One thread per connection.  The viewer opens a lot of connections at once (and some of
+    # them it never sends a request on) so a single threaded server ends up sitting on an idle
+    # connection while the requests actually waiting on an answer never get served.
+    daemon_threads = True
+    # HTTPServer turns this on. On Windows SO_REUSEADDR lets a second process bind this
+    # same port while the first is still listening, and the two then split requests.
+    allow_reuse_address = False
+    # The stock default of 5 is far too small for the burst of connections a browser opens
+    request_queue_size = 128
+
+    def handle_error(self, request, client_address):
+        error = sys.exc_info()[1]
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            # Browser gave up on (or cancelled) a request, nothing to report
+            logging.debug(f"Connection with {client_address} ended early: {error}")
+        else:
+            logging.exception(f"Error while handling a request from {client_address}")
+
+
 def startServer(baseDir, pageId, browserLaunch, bindAddress, bindPort):
     global SERVED_BASE_URL
     twinDir = getPageId(pageId)
@@ -1486,18 +1973,27 @@ def startServer(baseDir, pageId, browserLaunch, bindAddress, bindPort):
             raise Exception(f"Unable to change to download directory for twin of: {fullPath} or {os.path.abspath(relativeToScriptDir)} make sure the download is there")
     else:
         os.chdir(twinDir)
+    # force=True is required: in interactive mode consoleLog() has already run before we get
+    # here, and because the root logger had no handlers Python's logging auto-called
+    # basicConfig() which installed a stderr StreamHandler.  Without force=True that
+    # pre-existing handler makes this basicConfig a no-op, so server.log is never created
+    # and nothing is ever written to it.  force=True clears the old handlers first.
     try:
-        logging.basicConfig(filename="server.log", filemode="w", encoding="utf-8", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        logging.basicConfig(filename="server.log", filemode="w", encoding="utf-8", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
     except ValueError:
-        logging.basicConfig(filename="server.log", filemode="w", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+        logging.basicConfig(filename="server.log", filemode="w", level=logging.DEBUG, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%Y-%m-%d %H:%M:%S", force=True)
 
     if CLA.getCommandLineArg(CommandLineArg.CONSOLE_LOG):
         logging.getLogger().addHandler(logging.StreamHandler())
 
-    logging.info(f"Server starting up {sys_info()}")
     SERVED_BASE_URL = url = f"http://{bindAddress}:{bindPort}"
+    logging.info(f"Server starting up {sys_info()}")
+    # People look for this file constantly when a load goes wrong (and wonder whether it is even
+    # live) so record where it is, what is served, and which process is the one writing it
+    logging.info(f"Serving {os.getcwd()} at {url} from process {os.getpid()}, log at {os.path.abspath('server.log')}")
+    print(f"Serving {os.getcwd()} at {url}\nLogging to: {os.path.abspath('server.log')} (process {os.getpid()})")
     print("View in browser: " + url)
-    httpd = HTTPServer((bindAddress, bindPort), OurSimpleHTTPRequestHandler)
+    httpd = OurThreadingHTTPServer((bindAddress, bindPort), OurSimpleHTTPRequestHandler)
     if browserLaunch:
         print(f"Going to try and launch browser type: {browserLaunch}")
         import webbrowser

@@ -2,3 +2,9 @@
 downloads/
 output/
 defaults.json
+
+#Mine
+venv/
+__pycache__/
+diag.json
+_t_out.txt
