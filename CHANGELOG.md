@@ -1,3 +1,9 @@
+# 2026-11-02
+- Show-page `validUntil` values stored as escaped JSON (`\"validUntil\":\"2026-...`) are rewritten to 2099 along with plain JSON, so signatures baked into the HTML do not expire out from under the local viewer.
+- An HTTP 429 waits and retries up to 5 more times, backing off 2, 4, 8, 16, then 32 seconds. A 404 is not retried.
+- Graph download also requests `GetModelAssets` and `GetSweeps` (persisted-query hashes captured from the live showcase).
+- An alias made from the interactive rename is a symlink whose target is the model id beside it. Serving `python matterport-dl.py "<alias>" 127.0.0.1 8080` opens that folder.
+
 # 2026-10-23
 - Fixed the viewer sometimes hanging on the loading spinner (only a page reload got you out of it).  The local server now answers every browser connection on its own thread with http/1.1 keep alive (was one connection at a time with a backlog of 5, so requests the viewer was waiting on could go unserved while the browser sat on an idle connection), always sends a complete response for graph api requests (an operationName we don't know used to answer with nothing at all, leaving the showcase waiting on that promise forever), consumes post bodies, and sends a content length on every response.
 - The 30 second keep alive timeout only applies while waiting for the next request on a connection now, it can no longer cut a large asset (a 5 MB mesh tile for example) off half way through handing it to a browser that is momentarily busy.

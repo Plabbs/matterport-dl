@@ -404,15 +404,35 @@ async def downloadFile(type, shouldExist, url, file, post_data=None, always_down
         if not CLA.getCommandLineArg(CommandLineArg.DOWNLOAD) or (os.path.exists(file) and not always_download):  # skip already downloaded files except always download ones which are genreally ones that may contain keys?
             logUrlDownloadSkipped(type, file, url, "")
             return
-        reqId = logUrlDownloadStart(type, file, url, "", shouldExist, key_type=key_type)
-        try:
+
+        async def fetchAndSave():
             response = await OUR_SESSION.get(url)
             response.raise_for_status()  # Raise an exception if the response has an error status code
             async with aiofiles.open(file, "wb") as f:
                 await f.write(response.content)
+
+        reqId = logUrlDownloadStart(type, file, url, "", shouldExist, key_type=key_type)
+        try:
+            await fetchAndSave()
             logUrlDownloadFinish(type, file, url, "", shouldExist, reqId)
             return
         except Exception as err:
+            # Matterport answers 429 when a burst is too fast. Wait 2, 4, 8, 16, then 32 seconds.
+            if "Error 429" in f"{err}":
+                backoff = INITIAL_429_BACKOFF
+                for attempt in range(MAX_429_RETRIES):
+                    consoleLog(f"Rate limited (429), retrying {file} in {backoff:.0f}s (attempt {attempt + 1}/{MAX_429_RETRIES})")
+                    await asyncio.sleep(backoff)
+                    try:
+                        await fetchAndSave()
+                        logUrlDownloadFinish(type, file, url, "", shouldExist, reqId)
+                        return
+                    except Exception as retry_err:
+                        err = retry_err
+                        if "Error 429" not in f"{retry_err}":
+                            break
+                        backoff *= 2
+
             # Try again but with different accesskeys, if error is 404 though no need to retry
             if "?t=" in url and "Error 404" not in f"{err}":
                 if False:  # disable brute forcing at a minimum probably shouldnt do getallkeys just primary
@@ -434,8 +454,15 @@ async def downloadFile(type, shouldExist, url, file, post_data=None, always_down
             raise Exception(f"Request error for url: {url} ({type}) that would output to: {file} of: {err}") from err
 
 
+MAX_429_RETRIES = 5  # retries after the first HTTP 429
+INITIAL_429_BACKOFF = 2.0  # seconds; doubles each retry (2, 4, 8, 16, 32)
+
+
 def validUntilFix(text):
-    return re.sub(r"validUntil\"\s*:\s*\"20[\d]{2}-[\d]{2}-[\d]{2}T", 'validUntil":"2099-01-01T', text)
+    # Plain JSON ("validUntil": "2026-...") and the escaped form baked into the show page (\"validUntil\":\"2026-...)
+    text = re.sub(r"validUntil\"\s*:\s*\"20[\d]{2}-[\d]{2}-[\d]{2}T", 'validUntil":"2099-01-01T', text)
+    text = re.sub(r'validUntil\\"\s*:\s*\\"20[\d]{2}-[\d]{2}-[\d]{2}T', 'validUntil\\":\\"2099-01-01T', text)
+    return text
 
 
 async def downloadGraphModels(pageid):
@@ -1894,6 +1921,8 @@ GRAPH_DATA_REQ = {
     "GetRoomBounds": "?operationName=GetRoomBounds&variables=%7B%22modelId%22%3A%22[MATTERPORT_MODEL_ID]%22%7D&extensions=%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%2214f99a0c44512f435987f1305eacdaea7ca600f2b5e9022499087188e63915aa%22%7D%7D",
     "GetShowcaseSweeps": "?operationName=GetShowcaseSweeps&variables=%7B%22modelId%22%3A%22[MATTERPORT_MODEL_ID]%22%7D&extensions=%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%220faff869a8ae9385fe262d18ea1f731bbbeb3d618c036e60a8d0d630ae3526a5%22%7D%7D",
     "GetSnapshots": "?operationName=GetSnapshots&variables=%7B%22modelId%22%3A%22[MATTERPORT_MODEL_ID]%22%7D&extensions=%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%22510bd772b16a48aa4ea74aa290373225eeb306b3162fa34c75d6f643daf3f22b%22%7D%7D",
+    "GetModelAssets": "?operationName=GetModelAssets&variables=%7B%22modelId%22%3A%22[MATTERPORT_MODEL_ID]%22%7D&extensions=%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%2288fcfb6cb48b4c99c53623b3d939da42da1a700014fe1e926ba6f14f49b777c2%22%7D%7D",
+    "GetSweeps": "?operationName=GetSweeps&variables=%7B%22sweepIds%22%3Anull%2C%22modelId%22%3A%22[MATTERPORT_MODEL_ID]%22%2C%22sweepTags%22%3A%5B%22showcase%22%5D%7D&extensions=%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%22f7f1c9ec3e99b6579e76291da523de689c07d5e2c421f4ab82cf826b19af2427%22%7D%7D",
     # the following normally only seen on defurnished views directly
     "GetRoomClassifications": "?operationName=GetRoomClassifications&variables=%7B%7D&extensions=%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%22fdfefe83b3f6c491b0b76576b34366278274c92b36324bef4dd299d39fb986f3%22%7D%7D",  # yes get room classificaitons does not take a model id
     "GetRooms": "?operationName=GetRooms&variables=%7B%22modelId%22%3A%22[MATTERPORT_MODEL_ID]%22%7D&extensions=%7B%22persistedQuery%22%3A%7B%22version%22%3A1%2C%22sha256Hash%22%3A%223743bbb80ad617297c8e8c943499144b8ff20840a5c1fd48e5d3d131d915ed3a%22%7D%7D",
@@ -1963,7 +1992,8 @@ class OurThreadingHTTPServer(ThreadingHTTPServer):
 
 def startServer(baseDir, pageId, browserLaunch, bindAddress, bindPort):
     global SERVED_BASE_URL
-    twinDir = getPageId(pageId)
+    # pageId is already a model id, or an alias folder name. getPageId only accepts model ids.
+    twinDir = pageId
     if not os.path.exists(twinDir):
         fullPath = os.path.abspath(twinDir)
         relativeToScriptDir = os.path.join(BASE_MATTERPORTDL_DIR, baseDir, twinDir)
@@ -2289,7 +2319,13 @@ def main():
         # Check if pageIdOrIp is an IP address
         ip_pattern = re.compile(r"^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$")
         if not ip_pattern.match(pageIdOrIp):
-            pageId = getPageId(pageIdOrIp)
+            # A renamed model is a symlink under the download folder. Its name is a title, not a model id.
+            # A server run of a folder that is already there uses that name. A download still goes through getPageId.
+            existing_download = os.path.join(baseDir, pageIdOrIp)
+            if os.path.isdir(existing_download) and len(sys.argv) == argPos + 3:
+                pageId = pageIdOrIp
+            else:
+                pageId = getPageId(pageIdOrIp)
             argPos += 1
             if len(sys.argv) == argPos:  # if no more args its a download run
                 isDownloadRun = True

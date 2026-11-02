@@ -96,10 +96,12 @@ def create_alias_smylink(model_id, alias):
     """Create a symlink in the downloads folder pointing to the model_id"""
     downloads_path = get_downloads_path()
     alias_path = os.path.join(downloads_path, alias)
-    model_path = os.path.join(downloads_path, model_id)
+    # The link lives next to the model folder, so the target is just the model id.
+    # A target of downloads/<id> resolves to downloads/downloads/<id>.
+    # target_is_directory is required on Windows: the relative target is not a directory from the process cwd.
     if not os.path.exists(alias_path):
         try:
-            os.symlink(model_path, alias_path)
+            os.symlink(model_id, alias_path, target_is_directory=True)
             print_colored(f"Created symlink {alias} pointing to {model_id}", bcolors.OKGREEN)
         except OSError as e:
             print_colored(f"Error creating symlink alias {alias}: {e}", bcolors.WARNING)
